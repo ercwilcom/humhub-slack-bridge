@@ -1,0 +1,45 @@
+# Slack app manifest for the bridge.
+#
+# Paste into https://api.slack.com/apps → Create New App → From a manifest.
+#
+# NOTE: `event_subscriptions` is deliberately absent. Slack verifies the
+# Request URL at the moment you save it — if it were listed here, creating the
+# app would fail until HumHub has the signing secret, because the bridge
+# refuses everything before that. So: create the app without it, configure
+# HumHub, then add the URL in Slack's interface (step 4 of the README).
+
+display_information:
+  name: HumHub Bridge
+  description: Mirrors messages from chosen channels into HumHub.
+  background_color: "#1c5c7c"
+
+features:
+  bot_user:
+    display_name: HumHub Bridge
+    always_online: false
+
+oauth_config:
+  scopes:
+    bot:
+      # Read messages — the substance of the bridge.
+      - channels:history       # public channels
+      - groups:history         # private channels
+
+      # List channels on the admin page, so nobody has to type a channel id.
+      - channels:read
+      - groups:read
+
+      # Name the people mentioned in a message.
+      - users:read
+
+      # REQUIRED: the email address is what ties a Slack author to a HumHub
+      # account. Without this scope, nothing is ever mirrored.
+      - users:read.email
+
+      # Fetch attached images and documents.
+      - files:read
+
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

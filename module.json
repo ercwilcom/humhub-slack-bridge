@@ -1,0 +1,25 @@
+{
+    "id": "slack-bridge",
+    "name": "Slack Bridge",
+    "description": "Mirrors chosen Slack channels into Space streams, posted under the matching member's own name. Edits and deletions in Slack follow through, and attachments come across.",
+    "keywords": [
+        "slack",
+        "integration",
+        "bridge",
+        "mirror",
+        "stream",
+        "webhook"
+    ],
+    "version": "1.0.0",
+    "humhub": {
+        "minVersion": "1.18"
+    },
+    "homepage": "https://tou.ski",
+    "authors": [
+        {
+            "name": "tou.ski",
+            "homepage": "https://tou.ski",
+            "role": "Developer"
+        }
+    ]
+}

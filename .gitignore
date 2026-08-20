@@ -1,0 +1,6 @@
+# Les dépendances Composer sont reproductibles depuis composer.lock.
+/vendor/
+# Les clés de signature sont des secrets d'environnement, jamais du code.
+/keys/
+/runtime/
+.DS_Store
