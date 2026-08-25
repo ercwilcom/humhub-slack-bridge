@@ -17,8 +17,13 @@
     "homepage": "https://tou.ski",
     "authors": [
         {
-            "name": "tou.ski",
-            "homepage": "https://tou.ski",
+            "name": "Eric Williams",
+            "homepage": "https://wileri.net",
+            "role": "Developer"
+        },
+        {
+            "name": "la Coop MIL",
+            "homepage": "https://coopmil.ca",
             "role": "Developer"
         }
     ]
