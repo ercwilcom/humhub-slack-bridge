@@ -10,6 +10,7 @@ use yii\helpers\Url;
 /** @var array<int, string> $spaceNames */
 /** @var SlackEvent[] $events */
 /** @var array<string, int> $skipped */
+/** @var int $aApparier */
 
 $statusLabels = [
     SlackEvent::STATUS_POSTED => [Yii::t('SlackBridgeModule.base', 'Mirrored'), 'success'],
@@ -128,7 +129,14 @@ $unset = Yii::t('SlackBridgeModule.base', 'Not set');
 </div>
 
 <div class="panel panel-default">
-    <div class="panel-heading"><?= Yii::t('SlackBridgeModule.base', '<strong>Skipped</strong> messages') ?></div>
+    <div class="panel-heading">
+        <?= Yii::t('SlackBridgeModule.base', '<strong>Skipped</strong> messages') ?>
+        <a class="btn btn-<?= $aApparier > 0 ? 'primary' : 'default' ?> btn-sm pull-right" href="<?= Url::to(['authors']) ?>">
+            <?= $aApparier > 0
+                ? Yii::t('SlackBridgeModule.base', 'Pair {n} author(s)', ['n' => $aApparier])
+                : Yii::t('SlackBridgeModule.base', 'Authors') ?>
+        </a>
+    </div>
     <div class="panel-body">
         <p class="text-muted">
             <?= Yii::t('SlackBridgeModule.base', 'A skipped message is mirrored nowhere, and nothing marks the gap in the stream. That is what happens to authors with no account here: their share of the conversation is missing, and the thread reads as though it were complete. This table is the only place that absence is visible.') ?>

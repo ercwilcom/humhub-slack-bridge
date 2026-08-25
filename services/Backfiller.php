@@ -21,6 +21,12 @@ use Yii;
  * correctif, et c'est précisément sur les vieux messages que personne n'irait
  * vérifier.
  *
+ * ── RELANCER EST UN GESTE, ET IL RATTRAPE LES ÉCARTS ────────────────────────
+ * Un message déjà republié est reconnu et sauté ; un message ÉCARTÉ, lui, est
+ * rejoué. C'est la différence entre une reprise rejouable et une reprise
+ * définitive : apparier quelqu'un ne servirait à rien si ses trois mois de
+ * messages restaient écartés par la décision d'un premier passage.
+ *
  * ── LE PLAFOND EST CHEZ SLACK, PAS ICI ──────────────────────────────────────
  * Mesuré le 2026-08-20 sur l'espace de la coop : `conversations.history` ne
  * rend rien de plus vieux que 90 jours (limite du forfait gratuit). Ce n'est
@@ -191,6 +197,9 @@ class Backfiller
      * entrer en collision avec un identifiant de Slack (les leurs commencent
      * par `Ev`), et le registre garde ainsi la trace de ce qui vient de la
      * reprise plutôt que du direct — utile le jour où un écart surprend.
+     *
+     * Il est aussi DÉTERMINISTE, et c'est ce qui permet de retrouver un passage
+     * précédent pour le rejouer.
      */
     private function importOne(string $channelId, string $ts, array $message): string
     {
@@ -202,18 +211,32 @@ class Backfiller
             'event' => $message + ['type' => 'message', 'channel' => $channelId],
         ];
 
+        $eventId = 'backfill:' . $channelId . ':' . $ts;
+
         try {
-            $record = SlackEvent::claim('backfill:' . $channelId . ':' . $ts, $payload);
+            $record = SlackEvent::claim($eventId, $payload);
         } catch (Throwable $e) {
             Yii::error('slack-bridge : reprise refusée au registre (' . $ts . ') — ' . $e->getMessage(), 'slack-bridge');
             return 'echecs';
         }
 
         if ($record === null) {
-            // Déjà inscrit lors d'un passage précédent, mais sans message
-            // republié — donc écarté ou en échec. On ne le rejoue pas ici :
-            // c'est le travail du balayage, qui sait distinguer les deux.
-            return 'deja';
+            // Déjà inscrit lors d'un passage précédent. S'il n'a rien produit,
+            // on le REJOUE — et c'est ce qui rend la promesse de la commande
+            // vraie : apparier quelqu'un puis relancer rattrape ses messages.
+            //
+            // ── POURQUOI ICI ET PAS AU BALAYAGE HORAIRE ─────────────────────
+            // Un écart n'est pas un échec : il est la conséquence d'un état du
+            // monde — cette personne n'a pas de compte apparié, ce canal n'avait
+            // pas de règle. Le rejouer toutes les heures serait s'entêter contre
+            // une réponse qui ne changera pas toute seule. Relancer la reprise
+            // est un GESTE : quelqu'un vient de changer cet état du monde, et
+            // demande qu'on regarde à nouveau. Le balayage automatique garde ses
+            // deux états — en attente et en échec — et rien d'autre.
+            $record = SlackEvent::findOne(['event_id' => $eventId]);
+            if ($record === null || $record->status === SlackEvent::STATUS_POSTED) {
+                return 'deja';
+            }
         }
 
         $this->importer->process($record);

@@ -2,12 +2,15 @@
 
 namespace humhub\modules\slackBridge\commands;
 
+use humhub\modules\slackBridge\models\SlackAuthor;
 use humhub\modules\slackBridge\models\SlackChannel;
 use humhub\modules\slackBridge\models\SlackEvent;
 use humhub\modules\slackBridge\models\SlackMessage;
 use humhub\modules\slackBridge\Module;
+use humhub\modules\slackBridge\services\AuthorRoster;
 use humhub\modules\slackBridge\services\Backfiller;
 use humhub\modules\slackBridge\services\MessageImporter;
+use humhub\modules\slackBridge\services\Replayer;
 use humhub\modules\slackBridge\services\SlackApi;
 use humhub\modules\slackBridge\services\Sweeper;
 use humhub\modules\post\models\Post;
@@ -39,6 +42,15 @@ class SlackController extends Controller
     /** `--since=1750000000` : horodatage Slack à partir duquel remonter. */
     public $since = '';
 
+    /** `--never` : cet auteur Slack ne doit JAMAIS être apparié (compte de rôle). */
+    public $never = false;
+
+    /** `--forget` : retire la décision, l'appariement redevient affaire de courriel. */
+    public $forget = false;
+
+    /** `--reason=…` : repasser sur un motif d'écart précis, plutôt que sur les rattrapables. */
+    public $reason = '';
+
     public function options($actionID): array
     {
         // On AJOUTE aux options du cœur au lieu de les remplacer : les rendre
@@ -46,7 +58,12 @@ class SlackController extends Controller
         // exécution détachée passe — et le refus nommerait l'option, pas nous.
         return array_merge(
             parent::options($actionID),
-            $actionID === 'backfill' ? ['dryRun', 'limit', 'since'] : [],
+            match ($actionID) {
+                'backfill' => ['dryRun', 'limit', 'since'],
+                'pair' => ['never', 'forget'],
+                'replay' => ['reason'],
+                default => [],
+            },
         );
     }
 
@@ -325,6 +342,164 @@ class SlackController extends Controller
         }
 
         $this->stdout(sprintf("\n%d redatés, %d disparus\n", $refaits, $disparus));
+
+        return ExitCode::OK;
+    }
+
+    /**
+     * Qui écrit dans Slack sans qu'on sache à qui l'attribuer ici.
+     *
+     *   php protected/yii slack-bridge/unpaired
+     *
+     * C'est le seul endroit, avec la page d'admin, où le miroir partiel se
+     * voit : leurs messages sont écartés en silence, et le fil se lit comme
+     * s'il était complet.
+     */
+    public function actionUnpaired(): int
+    {
+        $roster = (new AuthorRoster())->unpaired();
+
+        if ($roster === []) {
+            $this->stdout("Personne : tout ce qui a été écarté l'a été pour une autre raison.\n");
+            return ExitCode::OK;
+        }
+
+        foreach ($roster as $line) {
+            $decision = match (true) {
+                $line['decision'] === null => '',
+                $line['decision'] === false => '  → jamais apparier',
+                default => '  → ' . (User::findOne(['id' => $line['decision']])?->displayName ?? ('compte #' . $line['decision'])),
+            };
+            $this->stdout(sprintf(
+                "  %-12s %-28s %-38s %3d msg%s\n",
+                $line['slack_user_id'],
+                mb_substr($line['name'], 0, 28),
+                mb_substr($line['email'], 0, 38),
+                $line['messages'],
+                $decision,
+            ));
+        }
+
+        $aFaire = count(array_filter($roster, fn(array $l): bool => $l['decision'] === null));
+        $this->stdout(sprintf("\n%d auteur(s), dont %d sans décision.\n", count($roster), $aFaire));
+        $this->stdout("Apparier : slack-bridge/pair <U…> <courriel|id> — puis relancer slack-bridge/backfill.\n");
+
+        return ExitCode::OK;
+    }
+
+    /**
+     * Apparie un auteur Slack à un compte du Hub, sans toucher à aucune adresse.
+     *
+     *   php protected/yii slack-bridge/pair U07ABC123 quelquun@exemple.org
+     *   php protected/yii slack-bridge/pair U07ABC123 42
+     *   php protected/yii slack-bridge/pair U07ABC123 --never
+     *   php protected/yii slack-bridge/pair U07ABC123 --forget
+     *
+     * L'appariement ne rattrape pas les messages à lui seul : il dit qui est
+     * qui. C'est `slack-bridge/backfill` qui repasse ensuite sur ce qui avait
+     * été écarté.
+     */
+    public function actionPair(string $slackUserId, ?string $who = null): int
+    {
+        $slackUserId = strtoupper(trim($slackUserId));
+
+        if ($this->forget) {
+            SlackAuthor::forget($slackUserId);
+            $this->stdout("Décision retirée pour $slackUserId.\n");
+            return ExitCode::OK;
+        }
+
+        // Le nom lu dans Slack au moment de la décision : la page d'admin reste
+        // lisible même quand l'API est injoignable, et le journal dit à qui on
+        // a cru avoir affaire.
+        $label = null;
+        try {
+            $label = (new SlackApi())->getUserName($slackUserId);
+        } catch (Throwable $e) {
+            // Sans importance : le nom n'est que du confort d'affichage.
+        }
+
+        if ($this->never) {
+            SlackAuthor::bind($slackUserId, null, $label);
+            $this->stdout("$slackUserId ne sera jamais apparié" . ($label !== null ? " ($label)" : '') . ".\n");
+            return ExitCode::OK;
+        }
+
+        if ($who === null || $who === '') {
+            $this->stderr("Il manque le compte : un courriel, un identifiant, ou --never.\n", Console::FG_RED);
+            return ExitCode::USAGE;
+        }
+
+        $user = ctype_digit($who)
+            ? User::findOne(['id' => (int) $who])
+            : User::findOne(['email' => $who]);
+
+        if ($user === null) {
+            $this->stderr("Aucun compte pour « $who ».\n", Console::FG_RED);
+            return ExitCode::UNSPECIFIED_ERROR;
+        }
+        if ((int) $user->status !== User::STATUS_ENABLED) {
+            // Republier au nom d'un compte désactivé ferait réapparaître
+            // quelqu'un qui est parti : l'appariement le refuse comme le
+            // courriel le refuse.
+            $this->stderr("Le compte « {$user->displayName} » n'est pas actif.\n", Console::FG_RED);
+            return ExitCode::UNSPECIFIED_ERROR;
+        }
+
+        SlackAuthor::bind($slackUserId, (int) $user->id, $label);
+        $this->stdout(sprintf(
+            "%s%s → %s (%s)\n",
+            $slackUserId,
+            $label !== null ? " ($label)" : '',
+            $user->displayName,
+            $user->email,
+        ));
+        $this->stdout("Relancer slack-bridge/backfill pour rattraper ses messages écartés.\n");
+
+        return ExitCode::OK;
+    }
+
+    /**
+     * Repasse sur ce qui avait été écarté, quand la raison de l'écart a été
+     * levée.
+     *
+     *   php protected/yii slack-bridge/replay
+     *   php protected/yii slack-bridge/replay U07ABC123
+     *   php protected/yii slack-bridge/replay --reason=unsupported_subtype
+     *
+     * À lancer après avoir apparié quelqu'un, ajouté une règle, ou retiré une
+     * condition. Rien n'est demandé à Slack : le registre garde le message
+     * d'origine, donc ce rattrapage marche même au-delà des 90 jours que
+     * l'API veut bien rendre.
+     *
+     * Silencieux et daté du message, comme une reprise d'historique : personne
+     * n'a à être prévenu d'une conversation d'il y a deux mois.
+     *
+     * `--reason` nomme un motif précis : c'est le geste d'après une mise à jour
+     * qui a élargi ce que le miroir sait porter, quand ce n'est pas le monde qui
+     * a changé mais le code.
+     *
+     * @param string|null $slackUserId ne repasser que sur les messages de cet auteur
+     */
+    public function actionReplay(?string $slackUserId = null): int
+    {
+        $counts = (new Replayer())->run(
+            $slackUserId !== null ? strtoupper($slackUserId) : null,
+            1000,
+            $this->reason !== '' ? $this->reason : null,
+        );
+
+        $this->stdout(sprintf(
+            "%d examinés — repris %d, encore écartés %d, échecs %d\n",
+            $counts['vus'],
+            $counts['repris'],
+            $counts['ecartes'],
+            $counts['echecs'],
+        ));
+
+        if ($counts['restants'] > 0) {
+            $this->stdout($counts['restants'] . " écart(s) non examiné(s) : relancer pour la suite.\n", Console::FG_YELLOW);
+        }
 
         return ExitCode::OK;
     }

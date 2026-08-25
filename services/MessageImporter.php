@@ -6,6 +6,7 @@ use humhub\modules\comment\models\Comment;
 use humhub\modules\comment\Module as CommentModule;
 use humhub\modules\content\models\Content;
 use humhub\modules\slackBridge\models\SilentComment;
+use humhub\modules\slackBridge\models\SlackAuthor;
 use humhub\modules\slackBridge\models\SlackChannel;
 use humhub\modules\slackBridge\models\SlackEvent;
 use humhub\modules\slackBridge\models\SlackMessage;
@@ -56,6 +57,8 @@ class MessageImporter
     public const SKIP_NO_IMAGE = 'no_image';
     public const SKIP_NO_AUTHOR = 'no_author';
     public const SKIP_AUTHOR_NOT_MATCHED = 'author_not_matched';
+    /** Auteur Slack déclaré « à ne jamais apparier » — un compte de rôle, pas une personne. */
+    public const SKIP_AUTHOR_IGNORED = 'author_ignored';
     public const SKIP_EMPTY = 'empty_message';
     public const SKIP_UNKNOWN_MESSAGE = 'unknown_message';
 
@@ -197,8 +200,10 @@ class MessageImporter
         $author = $this->resolveAuthor((string) $event['user']);
         if ($author === null) {
             // L'écart le plus fréquent, et le plus consultable : la page d'admin
-            // le compte pour que le miroir partiel ne reste pas invisible.
-            $record->markSkipped(self::SKIP_AUTHOR_NOT_MATCHED);
+            // le compte pour que le miroir partiel ne reste pas invisible. Un
+            // compte de rôle écarté à dessein porte son propre motif : ce qui
+            // est décidé ne doit pas grossir la liste de ce qui reste à faire.
+            $record->markSkipped($this->skipReasonForAuthor((string) $event['user']));
             return;
         }
 
@@ -335,7 +340,7 @@ class MessageImporter
 
         $author = $this->resolveAuthor((string) $event['user']);
         if ($author === null) {
-            $record->markSkipped(self::SKIP_AUTHOR_NOT_MATCHED);
+            $record->markSkipped($this->skipReasonForAuthor((string) $event['user']));
             return;
         }
 
@@ -612,19 +617,42 @@ class MessageImporter
     }
 
     /**
-     * L'auteur Slack, retrouvé ici par son courriel.
+     * L'auteur Slack, retrouvé ici — par un appariement posé à la main s'il en
+     * existe un, par son courriel sinon.
+     *
+     * ── L'APPARIEMENT EXPLICITE PASSE DEVANT, ET NE RETOMBE PAS ─────────────
+     * Il existe exactement pour les cas où les deux adresses ne se ressemblent
+     * pas : consulter le courriel d'abord ne changerait rien quand il marche, et
+     * masquerait la décision quand il ne marche pas. Et une fois la décision
+     * prise, elle tranche — y compris « personne », qui est ce que rend un
+     * compte de rôle ou un compte apparié à quelqu'un depuis désactivé. Y
+     * ajouter un repli sur le courriel ferait republier ce que l'admin venait
+     * d'écarter.
      *
      * Le compte doit être actif : republier au nom d'un compte désactivé ferait
      * réapparaître dans le fil quelqu'un qui a quitté la coop.
      */
     private function resolveAuthor(string $slackUserId): ?User
     {
+        if (SlackAuthor::findOne(['slack_user_id' => $slackUserId]) !== null) {
+            return SlackAuthor::resolve($slackUserId);
+        }
+
         $email = $this->api->getUserEmail($slackUserId);
         if ($email === null) {
             return null;
         }
 
         return User::findOne(['email' => $email, 'status' => User::STATUS_ENABLED]);
+    }
+
+    /**
+     * « Pas trouvé » et « pas voulu » se comptent séparément sur la page
+     * d'admin : le premier est une chose à faire, le second est une chose faite.
+     */
+    private function skipReasonForAuthor(string $slackUserId): string
+    {
+        return SlackAuthor::isIgnored($slackUserId) ? self::SKIP_AUTHOR_IGNORED : self::SKIP_AUTHOR_NOT_MATCHED;
     }
 
     /**

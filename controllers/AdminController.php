@@ -3,13 +3,17 @@
 namespace humhub\modules\slackBridge\controllers;
 
 use humhub\modules\admin\components\Controller;
+use humhub\modules\slackBridge\models\SlackAuthor;
 use humhub\modules\slackBridge\models\SlackChannel;
 use humhub\modules\slackBridge\models\SlackEvent;
 use humhub\modules\slackBridge\Module;
+use humhub\modules\slackBridge\services\AuthorRoster;
 use humhub\modules\slackBridge\services\MessageImporter;
+use humhub\modules\slackBridge\services\Replayer;
 use humhub\modules\slackBridge\services\SlackApi;
 use humhub\modules\slackBridge\services\Sweeper;
 use humhub\modules\space\models\Space;
+use humhub\modules\user\models\User;
 use Throwable;
 use Yii;
 use yii\web\NotFoundHttpException;
@@ -26,6 +30,18 @@ use yii\web\NotFoundHttpException;
  */
 class AdminController extends Controller
 {
+    /** Valeur du formulaire d'appariement : rien de décidé pour cette personne. */
+    public const PAIR_UNDECIDED = '';
+
+    /** Valeur du formulaire d'appariement : à ne jamais apparier. */
+    public const PAIR_NEVER = 'never';
+
+    /**
+     * Combien d'écarts une seule sauvegarde rattrape. Une requête web n'est pas
+     * l'endroit où en reprendre mille — au-delà, la console prend le relais.
+     */
+    private const REPLAY_LIMIT = 100;
+
     public function actionIndex()
     {
         /** @var Module $module */
@@ -37,6 +53,97 @@ class AdminController extends Controller
             'spaceNames' => $this->spaceNames(),
             'events' => SlackEvent::find()->orderBy(['received_at' => SORT_DESC])->limit(40)->all(),
             'skipped' => $this->skipCounts(),
+            // Le nombre d'auteurs SANS DÉCISION, pas le nombre d'auteurs : c'est
+            // ce qui reste à faire, et c'est ce qui doit tomber à zéro.
+            'aApparier' => count(array_filter(
+                (new AuthorRoster())->unpaired(),
+                fn(array $line): bool => $line['decision'] === null,
+            )),
+        ]);
+    }
+
+    /**
+     * Apparier les auteurs Slack que le courriel ne retrouve pas.
+     *
+     * ── LA TROISIÈME VOIE ───────────────────────────────────────────────────
+     * Sans cet écran, réparer un appariement demandait de changer une adresse :
+     * celle du profil Slack, qui n'appartient qu'à la personne, ou celle du
+     * compte d'ici, qui peut le relier à une identité ailleurs. Les deux sont de
+     * mauvaises réponses à « le miroir attribue mal ». Ici on pose la
+     * correspondance, et les deux adresses restent ce qu'elles sont.
+     *
+     * ── APPARIER RATTRAPE, DANS LA FOULÉE ───────────────────────────────────
+     * Poser la correspondance sans reprendre les messages écartés serait un
+     * demi-geste : la personne resterait absente de tout ce qui s'est dit avant.
+     * L'enregistrement repasse donc sur ses écarts — en silence et à leur date,
+     * puisque ce n'est pas en train d'arriver. Le plafond existe parce qu'une
+     * requête web n'est pas un endroit où rattraper mille messages ; ce qui
+     * dépasse est nommé, et la console finit le travail.
+     */
+    public function actionAuthors()
+    {
+        $roster = new AuthorRoster();
+
+        if (Yii::$app->request->isPost) {
+            $this->forcePostRequest();
+
+            $choices = (array) Yii::$app->request->post('pair', []);
+            $labels = (array) Yii::$app->request->post('label', []);
+            $apparies = 0;
+            $repris = 0;
+            $restants = 0;
+
+            foreach ($choices as $slackUserId => $choice) {
+                // L'identifiant vient du formulaire : il part dans une clé
+                // primaire, on ne garde que sa forme.
+                $slackUserId = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string) $slackUserId));
+                $choice = (string) $choice;
+                if ($slackUserId === '' || $choice === self::PAIR_UNDECIDED) {
+                    continue;
+                }
+
+                $label = isset($labels[$slackUserId]) ? mb_substr((string) $labels[$slackUserId], 0, 191) : null;
+
+                if ($choice === self::PAIR_NEVER) {
+                    SlackAuthor::bind($slackUserId, null, $label);
+                    $apparies++;
+                    continue;
+                }
+
+                $user = User::findOne(['id' => (int) $choice, 'status' => User::STATUS_ENABLED]);
+                if ($user === null) {
+                    continue;
+                }
+
+                SlackAuthor::bind($slackUserId, (int) $user->id, $label);
+                $apparies++;
+
+                $counts = (new Replayer())->run($slackUserId, self::REPLAY_LIMIT);
+                $repris += $counts['repris'];
+                $restants += $counts['restants'];
+            }
+
+            if ($apparies > 0) {
+                Yii::$app->session->setFlash('success', Yii::t(
+                    'SlackBridgeModule.base',
+                    '{paired} author(s) paired, {mirrored} message(s) brought across.',
+                    ['paired' => $apparies, 'mirrored' => $repris],
+                ));
+            }
+            if ($restants > 0) {
+                Yii::$app->session->setFlash('info', Yii::t(
+                    'SlackBridgeModule.base',
+                    'Some skipped messages were left for later: run {command} to finish.',
+                    ['command' => 'php protected/yii slack-bridge/replay'],
+                ));
+            }
+
+            return $this->redirect(['authors']);
+        }
+
+        return $this->render('authors', [
+            'roster' => $roster->unpaired(),
+            'users' => $roster->candidates(),
         ]);
     }
 
@@ -229,6 +336,7 @@ class AdminController extends Controller
             MessageImporter::SKIP_SPACE_MISSING => Yii::t('SlackBridgeModule.base', "Space was deleted"),
             MessageImporter::SKIP_NO_IMAGE => Yii::t('SlackBridgeModule.base', "No image (rule is “images only”)"),
             MessageImporter::SKIP_PARENT_NOT_MIRRORED => Yii::t('SlackBridgeModule.base', "Reply to a message that was never mirrored"),
+            MessageImporter::SKIP_AUTHOR_IGNORED => Yii::t('SlackBridgeModule.base', "Author deliberately never paired"),
             MessageImporter::SKIP_COMMENTS_CLOSED => Yii::t('SlackBridgeModule.base', "Comments are closed on that post"),
             // Plus produit depuis que les réponses de fil deviennent des
             // commentaires ; le registre en garde des centaines.

@@ -32,6 +32,15 @@ mirrors *partially*, and the stream does not say so. The admin page counts these
 so the gap is visible somewhere — read it before concluding that a channel came
 across whole.
 
+When the two addresses simply differ, *Administration → Slack Bridge →
+Authors to pair* is the answer: it records the correspondence and changes
+neither address. That matters — the address on an account here may tie it to an
+identity somewhere else, so "fixing" a mirror by editing it can break a login.
+Pairing someone also brings their already-skipped messages across, silently and
+at their original date. A workspace's role and team accounts get the other
+decision, *never pair*: pairing one would publish under the name of a member who
+wrote nothing.
+
 **The mirror can retract.** Copying a channel wholesale makes public what was
 written in a conversational register. Slack edits and deletions are therefore
 propagated: deleting there deletes here. Without that, the only way to take back
@@ -110,6 +119,9 @@ php protected/yii slack-bridge/channels   # list channels the bot can see
 php protected/yii slack-bridge/retry      # re-run events left pending
 php protected/yii slack-bridge/backfill   # bring in a channel's history, threads included
 php protected/yii slack-bridge/redate     # re-stamp what was mirrored before dates came from Slack
+php protected/yii slack-bridge/unpaired  # who writes here without a matching account
+php protected/yii slack-bridge/pair      # pair a Slack author to an account (or never pair it)
+php protected/yii slack-bridge/replay    # re-examine skips whose reason has been lifted
 ```
 
 `backfill` walks each thread right after the message that opens it — replies
@@ -124,8 +136,17 @@ before timestamps came from Slack: it re-stamps every mirrored post and comment
 from the message that produced it. A message Slack recorded as edited keeps its
 edit time, so the pencil that is *true* survives. Run it once after upgrading.
 
-An hourly cron sweep retries anything that failed in flight. The normal path is
-inline, right after answering Slack's 200.
+`replay` is the counterpart to pairing, and the cheaper half of catching up: a
+skipped message is still in the registry, payload and all, so re-examining it
+costs no Slack call and works **past the 90-day wall** — what history can no
+longer be asked for, the registry already holds. It only reconsiders skips whose
+reason can be lifted by a human (no matching author, orphaned reply, no rule for
+the channel, "images only"); a bot message or an empty one is never revisited.
+Re-running `backfill` reconsiders them too.
+
+An hourly cron sweep retries anything that failed in flight — technical failures
+only. A skip is not a failure: it is the consequence of a state of the world, so
+re-examining one is a deliberate act, never a background loop.
 
 ## Security
 
