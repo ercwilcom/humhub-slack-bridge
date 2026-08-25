@@ -238,7 +238,10 @@ class SlackController extends Controller
         $importer = new MessageImporter();
         $tagged = $missing = $failed = 0;
 
-        foreach (SlackMessage::find()->all() as $mirror) {
+        // Les liens de commentaires sont écartés : un topic appartient au post,
+        // et les reprendre reposerait la même étiquette sur le même post autant
+        // de fois que son fil compte de réponses.
+        foreach (SlackMessage::find()->where(['comment_id' => null])->all() as $mirror) {
             $post = Post::findOne(['id' => $mirror->post_id]);
             if ($post === null) {
                 // Le post a été supprimé depuis (une rétractation côté Slack,
@@ -281,6 +284,47 @@ class SlackController extends Controller
             $missing,
             $failed,
         ));
+
+        return ExitCode::OK;
+    }
+
+    /**
+     * Repose les dates de tout ce qui est déjà republié, à partir du ts Slack.
+     *
+     *   php protected/yii slack-bridge/redate
+     *
+     * Un rattrapage, à passer UNE FOIS après la mise à jour qui a rendu la date
+     * de Slack systématique. Ce qui avait été republié avant porte l'heure de
+     * l'import, et les reprises d'historique portent en plus un crayon
+     * « modifié » que personne n'a mérité : leur date de création avait été
+     * reposée, pas leur date de modification, et HumHub montre le crayon dès que
+     * les deux diffèrent.
+     *
+     * Rejouable, et sans effet la seconde fois : il écrit une valeur calculée à
+     * partir du ts, pas un décalage. Un message que Slack a vu MODIFIER garde
+     * son heure de modification — voir `MessageImporter::restamp()`.
+     */
+    public function actionRedate(): int
+    {
+        $importer = new MessageImporter();
+        $refaits = $disparus = 0;
+
+        foreach (SlackMessage::find()->all() as $mirror) {
+            if ($importer->restamp($mirror)) {
+                $refaits++;
+            } else {
+                // Retiré du Hub depuis — une rétractation côté Slack, un ménage
+                // d'admin. Le lien survit à ce qu'il désignait ; ce n'est pas
+                // une anomalie à corriger ici.
+                $disparus++;
+            }
+
+            if ($refaits % 25 === 0) {
+                $this->stdout('.');
+            }
+        }
+
+        $this->stdout(sprintf("\n%d redatés, %d disparus\n", $refaits, $disparus));
 
         return ExitCode::OK;
     }

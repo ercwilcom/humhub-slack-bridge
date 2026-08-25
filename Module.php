@@ -8,7 +8,8 @@ use Yii;
  * Passerelle Slack → Hub.
  *
  * Un message publié dans un canal Slack cartographié reparaît dans le fil du
- * Space correspondant, signé par le membre qui l'a écrit.
+ * Space correspondant, signé par le membre qui l'a écrit, à l'heure où il a été
+ * écrit. Les réponses de son fil le suivent, en commentaires.
  *
  * Deux choses à garder en tête en lisant ce module :
  *

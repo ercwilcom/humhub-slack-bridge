@@ -220,6 +220,35 @@ class SlackApi
     }
 
     /**
+     * Les réponses d'un fil, de la plus ancienne à la plus récente.
+     *
+     * ⚠️ **Le premier élément rendu est le message d'OUVERTURE lui-même** :
+     * `conversations.replies` décrit le fil entier, pas ses réponses. Le prendre
+     * pour une réponse republierait chaque message de tête une seconde fois, en
+     * commentaire sous lui-même. L'appelant l'écarte à son `ts`.
+     *
+     * Aucune portée Slack de plus : ce point d'accès se lit avec le même
+     * `channels:history` / `groups:history` que l'historique du canal. Le mur
+     * des 90 jours vaut ici aussi — un fil hors de portée l'est en entier.
+     *
+     * @return array{messages: array<int, array>, cursor: string}
+     */
+    public function replies(string $channelId, string $threadTs, string $cursor = '', int $limit = 200): array
+    {
+        $params = ['channel' => $channelId, 'ts' => $threadTs, 'limit' => $limit];
+        if ($cursor !== '') {
+            $params['cursor'] = $cursor;
+        }
+
+        $data = $this->get('conversations.replies', $params, true);
+
+        return [
+            'messages' => $data['messages'] ?? [],
+            'cursor' => (string) ($data['response_metadata']['next_cursor'] ?? ''),
+        ];
+    }
+
+    /**
      * Slack répond 200 même sur erreur applicative : le vrai verdict est dans
      * le champ `ok` du corps. Un appel qui ne vérifierait que le code HTTP
      * lirait des tableaux vides sans jamais voir le problème.

@@ -228,7 +228,11 @@ class AdminController extends Controller
             MessageImporter::SKIP_CHANNEL_NOT_MAPPED => Yii::t('SlackBridgeModule.base', "Channel has no rule"),
             MessageImporter::SKIP_SPACE_MISSING => Yii::t('SlackBridgeModule.base', "Space was deleted"),
             MessageImporter::SKIP_NO_IMAGE => Yii::t('SlackBridgeModule.base', "No image (rule is “images only”)"),
-            MessageImporter::SKIP_THREAD_REPLY => Yii::t('SlackBridgeModule.base', "Thread reply"),
+            MessageImporter::SKIP_PARENT_NOT_MIRRORED => Yii::t('SlackBridgeModule.base', "Reply to a message that was never mirrored"),
+            MessageImporter::SKIP_COMMENTS_CLOSED => Yii::t('SlackBridgeModule.base', "Comments are closed on that post"),
+            // Plus produit depuis que les réponses de fil deviennent des
+            // commentaires ; le registre en garde des centaines.
+            MessageImporter::SKIP_THREAD_REPLY => Yii::t('SlackBridgeModule.base', "Thread reply (before threads were mirrored)"),
             MessageImporter::SKIP_BOT => Yii::t('SlackBridgeModule.base', "Bot message"),
             MessageImporter::SKIP_NO_AUTHOR => Yii::t('SlackBridgeModule.base', "No author"),
             MessageImporter::SKIP_EMPTY => Yii::t('SlackBridgeModule.base', "Empty message"),

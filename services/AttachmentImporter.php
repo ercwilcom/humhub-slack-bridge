@@ -2,16 +2,17 @@
 
 namespace humhub\modules\slackBridge\services;
 
+use humhub\components\ActiveRecord;
 use humhub\modules\slackBridge\Module;
 use humhub\modules\file\models\File;
-use humhub\modules\post\models\Post;
 use humhub\modules\user\models\User;
 use RuntimeException;
 use Throwable;
 use Yii;
 
 /**
- * Rapatrie les fichiers d'un message Slack et les accroche au post.
+ * Rapatrie les fichiers d'un message Slack et les accroche au post — ou au
+ * commentaire, quand le message était une réponse de fil.
  *
  * Les fichiers Slack ne sont pas publics : leur URL exige l'en-tête Bearer du
  * bot. On les recopie donc chez nous, plutôt que d'y renvoyer par un lien —
@@ -36,16 +37,22 @@ class AttachmentImporter
     }
 
     /**
+     * Le porteur est typé `ActiveRecord` de HumHub et non `Post` : c'est là que
+     * vit `fileManager`, et un commentaire en a un exactement comme un post —
+     * HumHub laisse d'ailleurs joindre un fichier à un commentaire par son
+     * propre formulaire.
+     *
+     * @param ActiveRecord $target le post ou le commentaire qui reçoit les fichiers
      * @param array<int, array<string, mixed>> $files objets `file` de Slack
      */
-    public function attachAll(Post $post, array $files, User $author): void
+    public function attachAll(ActiveRecord $target, array $files, User $author): void
     {
         foreach ($files as $slackFile) {
             try {
-                $this->attachOne($post, $slackFile, $author);
+                $this->attachOne($target, $slackFile, $author);
             } catch (Throwable $e) {
                 Yii::warning(
-                    'slack-bridge : pièce jointe abandonnée (post ' . $post->id . ', '
+                    'slack-bridge : pièce jointe abandonnée (' . $target::class . ' ' . $target->id . ', '
                     . ($slackFile['name'] ?? '?') . ') — ' . $e->getMessage(),
                     'slack-bridge',
                 );
@@ -53,7 +60,7 @@ class AttachmentImporter
         }
     }
 
-    private function attachOne(Post $post, array $slackFile, User $author): void
+    private function attachOne(ActiveRecord $target, array $slackFile, User $author): void
     {
         // Un fichier externe (Google Drive, lien collé) n'a pas d'octets chez
         // Slack : il n'y a rien à rapatrier.
@@ -102,7 +109,7 @@ class AttachmentImporter
         // taille et empreinte.
         $file->setStoredFileContent($content);
 
-        $post->fileManager->attach($file);
+        $target->fileManager->attach($file);
     }
 
     /** Respecte le plafond de l'install, borné par celui du module. */

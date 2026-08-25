@@ -2,7 +2,10 @@
 
 namespace humhub\modules\slackBridge\services;
 
+use humhub\modules\comment\models\Comment;
+use humhub\modules\comment\Module as CommentModule;
 use humhub\modules\content\models\Content;
+use humhub\modules\slackBridge\models\SilentComment;
 use humhub\modules\slackBridge\models\SlackChannel;
 use humhub\modules\slackBridge\models\SlackEvent;
 use humhub\modules\slackBridge\models\SlackMessage;
@@ -15,6 +18,14 @@ use Yii;
 
 /**
  * Le cœur de la passerelle : ce qu'un événement Slack devient ici.
+ *
+ * Deux formes, et la seconde n'existe que par la première : un message de
+ * premier niveau devient un POST, une réponse de fil devient un COMMENTAIRE
+ * sous le post de son message d'ouverture. Une réponse dont l'ouverture n'a pas
+ * été republiée n'a donc nulle part où aller, et s'écarte.
+ *
+ * Tout ce qui est publié porte l'HEURE DU MESSAGE SLACK, jamais celle de
+ * l'import — voir `backdate()`.
  *
  * Chaque événement finit dans un des trois états du registre — republié,
  * volontairement écarté, ou en échec technique. La distinction compte : un
@@ -29,7 +40,17 @@ class MessageImporter
     public const SKIP_NOT_A_MESSAGE = 'not_a_message';
     public const SKIP_SUBTYPE = 'unsupported_subtype';
     public const SKIP_BOT = 'bot_message';
+    /**
+     * Plus jamais émis : une réponse de fil devient un commentaire. Le motif
+     * reste nommé parce que le registre en porte des centaines, et qu'une page
+     * d'admin qui afficherait `thread_reply` brut ferait passer une décision
+     * d'hier pour une panne d'aujourd'hui.
+     */
     public const SKIP_THREAD_REPLY = 'thread_reply';
+    /** Réponse à un message qui, lui, n'a jamais été republié : rien à commenter. */
+    public const SKIP_PARENT_NOT_MIRRORED = 'parent_not_mirrored';
+    /** Le post d'accueil n'accepte pas de commentaire (verrouillé, archivé, module retiré). */
+    public const SKIP_COMMENTS_CLOSED = 'comments_closed';
     public const SKIP_CHANNEL_NOT_MAPPED = 'channel_not_mapped';
     public const SKIP_SPACE_MISSING = 'space_missing';
     public const SKIP_NO_IMAGE = 'no_image';
@@ -52,16 +73,18 @@ class MessageImporter
     /**
      * Reprise d'historique plutôt que message du jour (voir `Backfiller`).
      *
-     * Deux effets, et deux seulement — tout le reste du chemin est identique,
-     * ce qui est la raison d'être de ce drapeau plutôt que d'un second
-     * importeur :
+     * Un seul effet, désormais — tout le reste du chemin est identique, ce qui
+     * est la raison d'être de ce drapeau plutôt que d'un second importeur : ce
+     * qui est repris se crée en SILENCE. Ni activité, ni notification, ni
+     * poussée temps réel, ni remontée du post en tête du fil.
      *
-     *   1. le post porte la DATE du message Slack, pas celle de l'import ;
-     *   2. il se crée en SILENCE : ni activité, ni notification.
+     * Un message d'il y a deux mois qui notifie cent sept personnes ment sur ce
+     * qu'il est : ceci n'est pas en train d'arriver.
      *
-     * Les deux disent la même chose sous deux formes : ceci n'est pas en train
-     * d'arriver. Un post d'il y a deux mois qui remonte au sommet d'un tableau
-     * de bord, ou qui notifie cent sept personnes, ment sur ce qu'il est.
+     * ⚠️ **La DATE, elle, ne dépend plus de ce drapeau.** Tout ce que le miroir
+     * publie porte l'heure du message Slack, repris ou non — voir `backdate()`.
+     * C'est ce qui rend un message rattrapé trois heures plus tard par le
+     * balayage lisible à sa vraie place, au lieu de prétendre venir d'arriver.
      */
     public bool $historical = false;
 
@@ -98,6 +121,11 @@ class MessageImporter
                     // `file_share` : un message accompagné d'un fichier. C'est un
                     // message ordinaire du point de vue du miroir.
                 case 'file_share':
+                    // `thread_broadcast` : une réponse de fil que son auteur a
+                    // aussi renvoyée dans le canal. Elle reste une réponse — le
+                    // chemin ci-dessous la reconnaît à son `thread_ts` et en
+                    // fera un commentaire, pas un second post.
+                case 'thread_broadcast':
                     $this->handleNew($record, $event);
                     break;
                 case 'message_changed':
@@ -127,10 +155,15 @@ class MessageImporter
             return;
         }
 
-        // Une réponse de fil porte un thread_ts différent de son propre ts. Le
-        // choix retenu est de ne republier que les messages de premier niveau.
-        if (!empty($event['thread_ts']) && $event['thread_ts'] !== $ts) {
-            $record->markSkipped(self::SKIP_THREAD_REPLY);
+        // Une réponse de fil porte un thread_ts différent de son propre ts. Elle
+        // ne devient pas un post : elle devient un COMMENTAIRE sous le post du
+        // message qui a ouvert le fil. C'est la seule forme qui garde à la
+        // conversation la sienne — un fil de Slack recopié en cinq posts
+        // indépendants dans un espace est illisible, et les réponses y
+        // arriveraient séparées de ce à quoi elles répondent.
+        $threadTs = (string) ($event['thread_ts'] ?? '');
+        if ($threadTs !== '' && $threadTs !== $ts) {
+            $this->handleReply($record, $event, $threadTs);
             return;
         }
 
@@ -235,11 +268,153 @@ class MessageImporter
 
         // APRÈS les pièces jointes, à dessein : attacher un fichier touche au
         // contenu, et une date posée avant se ferait réécrire par le cœur.
-        if ($this->historical) {
-            $this->backdate($post, $ts);
-        }
+        $this->backdate($post, $ts);
 
         $record->markPosted((int) $post->id);
+    }
+
+    /**
+     * Une réponse de fil devient un COMMENTAIRE sous le post du message qui a
+     * ouvert le fil.
+     *
+     * ── CE QUE LA RÈGLE DU CANAL NE FILTRE PAS ICI ──────────────────────────
+     * La condition « avec image » ne porte que sur ce qui OUVRE une
+     * conversation : c'est un filtre sur ce qui devient un post, pas une
+     * exigence de forme sur ce qu'on se répond ensuite. Une réponse sans photo
+     * sous une annonce photographiée est exactement la conversation attendue.
+     * Le topic non plus ne se repose pas : il appartient au post, et un
+     * commentaire n'en porte pas.
+     *
+     * ── SANS PARENT, PAS DE COMMENTAIRE ─────────────────────────────────────
+     * Si le message d'ouverture n'a jamais été republié — auteur non apparié,
+     * règle « avec image », canal branché après coup, rétractation depuis —, il
+     * n'y a rien ici sous quoi accrocher la réponse. On l'écarte, sous son
+     * propre motif pour que le décompte de la page d'admin ne mélange pas les
+     * deux : fabriquer un post d'accueil publierait au nom de quelqu'un un
+     * message que le miroir avait écarté à dessein.
+     */
+    private function handleReply(SlackEvent $record, array $event, string $threadTs): void
+    {
+        $channelId = (string) ($event['channel'] ?? '');
+        $ts = (string) ($event['ts'] ?? '');
+
+        // Rejeu tardif d'un événement déjà traité : le commentaire est là, on ne
+        // le republie pas. Même raisonnement que pour un post, à ceci près que
+        // c'est le commentaire qu'on vérifie — le post, lui, existe forcément.
+        $existing = SlackMessage::findByTs($channelId, $ts);
+        if ($existing !== null && $existing->comment_id !== null
+            && Comment::findOne(['id' => $existing->comment_id]) !== null) {
+            $record->markPosted((int) $existing->post_id);
+            return;
+        }
+
+        $rule = $channelId !== '' ? SlackChannel::findOne(['channel_id' => $channelId, 'enabled' => true]) : null;
+        if ($rule === null) {
+            $record->markSkipped(self::SKIP_CHANNEL_NOT_MAPPED);
+            return;
+        }
+
+        $parent = SlackMessage::findByTs($channelId, $threadTs);
+        $post = $parent !== null ? Post::findOne(['id' => $parent->post_id]) : null;
+        if ($post === null) {
+            // « Pas encore » et « jamais » ne se ressemblent qu'ici : le
+            // registre les distingue. Si le message d'ouverture attend encore
+            // son tour — processus mort en route, échec technique pas épuisé —,
+            // la réponse est mise en échec plutôt qu'écartée, et le balayage
+            // horaire les reprendra tous deux, dans l'ordre. Un écart, lui, ne
+            // se rejoue jamais : le prononcer trop tôt perdrait la réponse en
+            // silence.
+            if ($this->parentStillComing($channelId, $threadTs)) {
+                $record->markFailed('Message d\'ouverture pas encore republié.');
+                return;
+            }
+
+            $record->markSkipped(self::SKIP_PARENT_NOT_MIRRORED);
+            return;
+        }
+
+        $author = $this->resolveAuthor((string) $event['user']);
+        if ($author === null) {
+            $record->markSkipped(self::SKIP_AUTHOR_NOT_MATCHED);
+            return;
+        }
+
+        // Le verrou des commentaires, l'archivage, la permission de commenter
+        // dans ce conteneur : la question se pose POUR L'AUTEUR, pas pour le
+        // processus. Un admin qui a verrouillé les commentaires d'un post
+        // republié a pris une décision ; la passerelle ne la contourne pas.
+        if (!$this->asUser($author, fn(): bool => $this->canComment($post))) {
+            $record->markSkipped(self::SKIP_COMMENTS_CLOSED);
+            return;
+        }
+
+        $message = $this->formatter->toMarkdown((string) ($event['text'] ?? ''));
+        $files = $this->attachableFiles($this->slackFiles($event));
+
+        if ($message === '' && $files === []) {
+            $record->markSkipped(self::SKIP_EMPTY);
+            return;
+        }
+
+        $comment = $this->asUser($author, function () use ($post, $author, $message): ?Comment {
+            // La forme silencieuse pour une reprise d'historique : le cœur n'a
+            // pas d'équivalent de `silentContentCreation` pour un commentaire.
+            $comment = $this->historical ? new SilentComment() : new Comment();
+            $comment->message = $message;
+            // setPolymorphicRelation() plutôt que object_model/object_id à la
+            // main : c'est le comportement du cœur qui pose le couple, et le
+            // formulaire de HumHub ne fait rien d'autre.
+            $comment->setPolymorphicRelation($post);
+            $comment->created_by = (int) $author->id;
+
+            return $comment->save() ? $comment : null;
+        });
+
+        if ($comment === null) {
+            $record->markFailed('Enregistrement du commentaire refusé.');
+            return;
+        }
+
+        SlackMessage::record($channelId, $ts, (int) $post->id, $parent->space_id, (int) $author->id, (int) $comment->id);
+
+        if ($files !== []) {
+            $this->attachments->attachAll($comment, $files, $author);
+        }
+
+        // Après les pièces jointes, pour la même raison que sur un post.
+        $this->backdateComment($comment, $ts);
+
+        $record->markPosted((int) $post->id);
+    }
+
+    /**
+     * Le message d'ouverture est-il encore en chemin ?
+     *
+     * Vrai tant que son événement est au registre sans verdict et avec des
+     * tentatives en réserve. Faux s'il a été écarté, s'il a épuisé ses essais,
+     * ou s'il n'est jamais passé par ici.
+     */
+    private function parentStillComing(string $channelId, string $threadTs): bool
+    {
+        return SlackEvent::find()
+            ->where(['channel_id' => $channelId, 'message_ts' => $threadTs])
+            ->andWhere(['status' => [SlackEvent::STATUS_PENDING, SlackEvent::STATUS_FAILED]])
+            ->andWhere(['<', 'attempts', SlackEvent::MAX_ATTEMPTS])
+            ->exists();
+    }
+
+    /**
+     * Le post d'accueil accepte-t-il un commentaire de l'utilisateur courant ?
+     *
+     * Le module `comment` est un module du cœur, mais il se désactive : sans
+     * lui, il n'y a pas de commentaire possible, et une réponse s'écarte au lieu
+     * d'échouer en boucle au balayage horaire.
+     */
+    private function canComment(Post $post): bool
+    {
+        $module = Yii::$app->getModule('comment');
+
+        return $module instanceof CommentModule && $module->canComment($post);
     }
 
     /**
@@ -302,12 +477,17 @@ class MessageImporter
     }
 
     /**
-     * Une modification dans Slack réécrit le post ici.
+     * Une modification dans Slack réécrit ici ce que le message avait produit —
+     * son post, ou son commentaire si c'était une réponse de fil.
      *
      * Sans ça, une correction resterait sans effet sur ce qui est publié — et
      * puisque tout le canal est recopié, la seule voie de rattrapage serait
      * l'admin du Hub. Le texte seul est repris : les pièces jointes d'un
      * message déjà publié ne changent pas dans Slack.
+     *
+     * La date de création ne bouge pas, l'heure de modification si : c'est
+     * exactement ce que HumHub montre par son crayon « modifié », et ici il dit
+     * vrai — le texte a bien changé après coup.
      */
     private function handleEdit(SlackEvent $record, array $event): void
     {
@@ -323,6 +503,39 @@ class MessageImporter
             return;
         }
 
+        $text = $this->formatter->toMarkdown((string) ($message['text'] ?? ''));
+        if ($text === '') {
+            $record->markSkipped(self::SKIP_EMPTY);
+            return;
+        }
+
+        $author = User::findOne(['id' => $mapping->author_id]);
+
+        if ($mapping->comment_id !== null) {
+            $comment = Comment::findOne(['id' => $mapping->comment_id]);
+            if ($comment === null) {
+                // Effacé côté Hub entre-temps — par un admin, ou avec le post
+                // qui le portait. Le lien ne vaut plus rien.
+                SlackMessage::forget($channelId, $ts);
+                $record->markSkipped(self::SKIP_UNKNOWN_MESSAGE);
+                return;
+            }
+
+            $saved = $this->asUser($author, function () use ($comment, $text): bool {
+                $comment->message = $text;
+
+                return $comment->save();
+            });
+
+            if (!$saved) {
+                $record->markFailed('Mise à jour du commentaire refusée.');
+                return;
+            }
+
+            $record->markPosted((int) $mapping->post_id);
+            return;
+        }
+
         $post = Post::findOne(['id' => $mapping->post_id]);
         if ($post === null) {
             // Supprimé côté Hub entre-temps : le lien ne vaut plus rien.
@@ -331,13 +544,6 @@ class MessageImporter
             return;
         }
 
-        $text = $this->formatter->toMarkdown((string) ($message['text'] ?? ''));
-        if ($text === '') {
-            $record->markSkipped(self::SKIP_EMPTY);
-            return;
-        }
-
-        $author = User::findOne(['id' => $mapping->author_id]);
         $saved = $this->asUser($author, function () use ($post, $text): bool {
             $post->message = $text;
 
@@ -353,10 +559,16 @@ class MessageImporter
     }
 
     /**
-     * Une suppression dans Slack retire le post ici.
+     * Une suppression dans Slack retire ici ce que le message avait produit.
      *
      * C'est la contrepartie indispensable du miroir intégral : effacer chez soi
      * doit suffire à effacer partout, sans passer par un admin.
+     *
+     * Retirer le message qui a ouvert un fil emporte ses réponses : HumHub
+     * supprime les commentaires avec leur contenu. C'est le bon comportement —
+     * ce qui reste sinon est une conversation sans ce à quoi elle répond — mais
+     * il laisse derrière lui des liens qui ne désignent plus rien, d'où le
+     * `forgetByPost()` plutôt qu'un simple `forget()`.
      */
     private function handleDelete(SlackEvent $record, array $event): void
     {
@@ -366,6 +578,20 @@ class MessageImporter
         $mapping = $ts !== '' ? SlackMessage::findByTs($channelId, $ts) : null;
         if ($mapping === null) {
             $record->markSkipped(self::SKIP_UNKNOWN_MESSAGE);
+            return;
+        }
+
+        if ($mapping->comment_id !== null) {
+            $comment = Comment::findOne(['id' => $mapping->comment_id]);
+            if ($comment !== null) {
+                // Un commentaire n'a pas de corbeille chez HumHub : delete() est
+                // déjà définitif, contrairement au post juste en dessous.
+                $author = User::findOne(['id' => $mapping->author_id]);
+                $this->asUser($author, fn() => $comment->delete());
+            }
+
+            SlackMessage::forget($channelId, $ts);
+            $record->markPosted(null);
             return;
         }
 
@@ -381,7 +607,7 @@ class MessageImporter
             $this->asUser($author, fn() => $post->hardDelete());
         }
 
-        SlackMessage::forget($channelId, $ts);
+        SlackMessage::forgetByPost((int) $mapping->post_id);
         $record->markPosted(null);
     }
 
@@ -448,6 +674,120 @@ class MessageImporter
     }
 
     /**
+     * Le post porte l'heure du message Slack, pas celle de l'import.
+     *
+     * ── POUR TOUT CE QUI PASSE, PAS SEULEMENT POUR UNE REPRISE ──────────────
+     * En temps réel l'écart n'est que de quelques secondes, et c'est justement
+     * ce qui rend la question invisible : le jour où le webhook a été coupé une
+     * heure, où le balayage horaire rattrape la panne, où une pièce jointe de
+     * trente mégaoctets a retenu l'import — alors la seule date que le fil
+     * puisse afficher sans mentir est celle de Slack. Une passerelle qui date
+     * ses copies de l'heure de la copie n'est pas un miroir.
+     *
+     * ── TROIS COLONNES, ET DEUX SONT CELLES QU'ON OUBLIE ────────────────────
+     * `created_at` dit ce qui s'affiche sous le nom de l'auteur ;
+     * `stream_sort_date` décide de la PLACE dans le fil — n'en poser qu'une
+     * donne un post daté de mai qui trône en tête de l'espace, le pire des deux
+     * mondes parce qu'il a l'air correct ; `updated_at` enfin décide du crayon
+     * « modifié », que HumHub affiche dès qu'il diffère de `created_at`. Sans
+     * lui, TOUT ce que la passerelle republie se présente comme retouché après
+     * coup, alors que personne n'y a touché.
+     *
+     * `updateAttributes()` et pas `save()` : on écrit ces colonnes-là et rien
+     * d'autre, sans réveiller les comportements d'horodatage du cœur, qui
+     * remettraient l'heure courante par-dessus.
+     *
+     * Une vraie modification venue de Slack, elle, repasse par `save()` : le
+     * crayon apparaît alors, et il dit vrai.
+     */
+    private function backdate(Post $post, string $ts, bool $keepUpdated = false): void
+    {
+        $stamp = self::stamp($ts);
+
+        $dates = ['created_at' => $stamp, 'stream_sort_date' => $stamp];
+        if (!$keepUpdated) {
+            $dates['updated_at'] = $stamp;
+        }
+
+        $post->content->updateAttributes($dates);
+        $post->updateAttributes($keepUpdated ? ['created_at' => $stamp] : ['created_at' => $stamp, 'updated_at' => $stamp]);
+    }
+
+    /**
+     * Même chose pour un commentaire, avec une colonne de moins : un
+     * commentaire ne décide pas de la place du post dans le fil — c'est le cœur
+     * qui s'en charge quand la réponse arrive pour de vrai, et la forme
+     * silencieuse de la reprise qui s'en abstient.
+     *
+     * `updated_at` compte autant qu'ici : `Comment::isUpdated()` compare les
+     * deux dates, et un fil entier de commentaires marqués « modifié » raconte
+     * une histoire qui n'a pas eu lieu.
+     */
+    private function backdateComment(Comment $comment, string $ts, bool $keepUpdated = false): void
+    {
+        $stamp = self::stamp($ts);
+
+        $comment->updateAttributes($keepUpdated ? ['created_at' => $stamp] : ['created_at' => $stamp, 'updated_at' => $stamp]);
+    }
+
+    /**
+     * Repose les dates d'un miroir DÉJÀ publié, à partir du ts qui l'a produit.
+     *
+     * Le rattrapage de `slack-bridge/redate`, pour ce qui est passé quand la
+     * date de l'import faisait foi. Il n'y a pas d'autre appelant : le chemin
+     * normal date à la publication.
+     *
+     * ⚠️ **Un message que Slack a vu modifier garde son heure de modification.**
+     * Sans ce garde, le rattrapage effacerait le crayon « modifié » de tout ce
+     * qui a VRAIMENT été corrigé — il ne réparerait pas un mensonge, il en
+     * poserait un autre. Le registre est la seule trace qui distingue les deux.
+     *
+     * @return bool false si le post ou le commentaire n'existe plus.
+     */
+    public function restamp(SlackMessage $mirror): bool
+    {
+        $keepUpdated = $this->wasEditedInSlack($mirror);
+
+        if ($mirror->comment_id !== null) {
+            $comment = Comment::findOne(['id' => $mirror->comment_id]);
+            if ($comment === null) {
+                return false;
+            }
+            $this->backdateComment($comment, $mirror->message_ts, $keepUpdated);
+
+            return true;
+        }
+
+        $post = Post::findOne(['id' => $mirror->post_id]);
+        if ($post === null) {
+            return false;
+        }
+        $this->backdate($post, $mirror->message_ts, $keepUpdated);
+
+        return true;
+    }
+
+    /** Le registre a-t-il traité une modification de ce message ? */
+    private function wasEditedInSlack(SlackMessage $mirror): bool
+    {
+        return SlackEvent::find()
+            ->where(['channel_id' => $mirror->channel_id, 'message_ts' => $mirror->message_ts])
+            ->andWhere(['status' => SlackEvent::STATUS_POSTED])
+            ->andWhere(['like', 'payload', 'message_changed'])
+            ->exists();
+    }
+
+    /**
+     * Un ts Slack est « 1787229101.378509 » — des secondes Unix avec une
+     * fraction qui distingue deux messages de la même seconde. MySQL n'en a que
+     * faire ; c'est la seconde qui nous intéresse.
+     */
+    private static function stamp(string $ts): string
+    {
+        return date('Y-m-d H:i:s', (int) (float) $ts);
+    }
+
+    /**
      * Exécute l'opération sous l'identité du membre, puis rend la main.
      *
      * HumHub lit l'utilisateur courant dans ses crochets d'après-sauvegarde —
@@ -455,32 +795,6 @@ class MessageImporter
      * crochets travaillent sur un invité. Le rétablissement importe surtout au
      * balayage console, qui enchaîne plusieurs auteurs dans un même processus.
      */
-    /**
-     * Le post prend la date du message Slack, pas celle de l'import.
-     *
-     * DEUX colonnes, et la seconde est celle qu'on oublie : `created_at` dit ce
-     * qui s'affiche sous le nom de l'auteur, `stream_sort_date` décide de la
-     * PLACE dans le fil. N'en poser qu'une donne un post daté de mai qui trône
-     * en tête du Space — le pire des deux mondes, parce qu'il a l'air correct.
-     *
-     * `updateAttributes()` et pas `save()` : on écrit ces colonnes-là et rien
-     * d'autre, sans réveiller les comportements d'horodatage du cœur, qui
-     * remettraient l'heure courante par-dessus.
-     */
-    private function backdate(Post $post, string $ts): void
-    {
-        // Un ts Slack est « 1787229101.378509 » — des secondes Unix avec une
-        // fraction qui distingue deux messages de la même seconde. MySQL n'en a
-        // que faire ; c'est la seconde qui nous intéresse.
-        $stamp = date('Y-m-d H:i:s', (int) (float) $ts);
-
-        $post->content->updateAttributes([
-            'created_at' => $stamp,
-            'stream_sort_date' => $stamp,
-        ]);
-        $post->updateAttributes(['created_at' => $stamp]);
-    }
-
     private function asUser(?User $user, callable $fn)
     {
         if ($user === null) {

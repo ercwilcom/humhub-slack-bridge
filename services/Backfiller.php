@@ -37,6 +37,13 @@ use Yii;
  *      du Space raconte que la coop a tout écrit le même après-midi.
  *   2. **Le silence.** Aucune activité, aucune notification : personne n'a à
  *      être prévenu de ce qui a été dit il y a deux mois.
+ *
+ * ── LES FILS TRAVERSENT AVEC LEURS MESSAGES ─────────────────────────────────
+ * `conversations.history` ne rend que les messages de tête : un canal repris
+ * sans ses fils arrive amputé de la moitié de sa conversation, et le fil de
+ * l'espace ne le dit pas. Chaque message qui annonce des réponses en déclenche
+ * donc la demande, juste après lui — c'est un appel d'API de plus par fil, et
+ * la seule contrainte d'ordre de toute la reprise.
  */
 class Backfiller
 {
@@ -74,42 +81,107 @@ class Backfiller
         $counts = ['vus' => 0, 'deja' => 0, 'repris' => 0, 'ecartes' => 0, 'echecs' => 0];
 
         foreach ($this->messages($rule->channel_id, $oldest) as $message) {
-            $counts['vus']++;
-
-            $ts = (string) ($message['ts'] ?? '');
-            if ($ts === '') {
-                continue;
-            }
-
-            // Le garde-fou qui rend la commande rejouable : un message déjà
-            // republié n'est même pas inscrit au registre. C'est ce qui permet
-            // de relancer après avoir apparié quelqu'un, sans rien dupliquer.
-            if (SlackMessage::findByTs($rule->channel_id, $ts) !== null) {
-                $counts['deja']++;
-                $progress && $progress($ts, 'deja');
-                continue;
-            }
-
-            if ($dryRun) {
-                // On ne PRÉDIT pas l'issue : elle dépend de l'appariement de
-                // l'auteur, que seul l'import résout. Annoncer « repris » ici
-                // pour découvrir « écarté » à l'exécution serait pire que se
-                // taire. Ce chiffre est donc « à tenter », pas « à publier ».
-                $counts['repris']++;
-                $progress && $progress($ts, 'a_tenter');
-                continue;
-            }
-
-            $issue = $this->importOne($rule->channel_id, $ts, $message);
-            $counts[$issue] = ($counts[$issue] ?? 0) + 1;
-            $progress && $progress($ts, $issue);
+            $this->one($rule, $message, $counts, $dryRun, $progress);
 
             if ($limit > 0 && $counts['repris'] >= $limit) {
                 break;
             }
+
+            // Puis le fil qui pend à ce message, s'il en a un. APRÈS lui, et
+            // c'est la seule contrainte d'ordre de toute la reprise : une
+            // réponse s'accroche au post de son message d'ouverture, donc elle
+            // n'a nulle part où aller tant qu'il n'est pas republié.
+            //
+            // `reply_count` est renseigné par l'historique du canal sur le
+            // message de tête ; ne demander le fil qu'à ceux qui en ont un
+            // épargne un appel d'API par message.
+            if ((int) ($message['reply_count'] ?? 0) < 1) {
+                continue;
+            }
+
+            foreach ($this->replies($rule->channel_id, (string) ($message['ts'] ?? '')) as $reply) {
+                $this->one($rule, $reply, $counts, $dryRun, $progress);
+
+                if ($limit > 0 && $counts['repris'] >= $limit) {
+                    break 2;
+                }
+            }
         }
 
         return $counts;
+    }
+
+    /**
+     * Un message — de tête ou de fil —, compté puis repris.
+     *
+     * @param array<string, int> $counts modifié sur place
+     */
+    private function one(SlackChannel $rule, array $message, array &$counts, bool $dryRun, ?callable $progress): void
+    {
+        $counts['vus']++;
+
+        $ts = (string) ($message['ts'] ?? '');
+        if ($ts === '') {
+            return;
+        }
+
+        // Le garde-fou qui rend la commande rejouable : un message déjà
+        // republié n'est même pas inscrit au registre. C'est ce qui permet
+        // de relancer après avoir apparié quelqu'un, sans rien dupliquer.
+        if (SlackMessage::findByTs($rule->channel_id, $ts) !== null) {
+            $counts['deja']++;
+            $progress && $progress($ts, 'deja');
+            return;
+        }
+
+        if ($dryRun) {
+            // On ne PRÉDIT pas l'issue : elle dépend de l'appariement de
+            // l'auteur, que seul l'import résout. Annoncer « repris » ici
+            // pour découvrir « écarté » à l'exécution serait pire que se
+            // taire. Ce chiffre est donc « à tenter », pas « à publier ».
+            $counts['repris']++;
+            $progress && $progress($ts, 'a_tenter');
+            return;
+        }
+
+        $issue = $this->importOne($rule->channel_id, $ts, $message);
+        $counts[$issue] = ($counts[$issue] ?? 0) + 1;
+        $progress && $progress($ts, $issue);
+    }
+
+    /**
+     * Les réponses d'un fil, sans son message d'ouverture.
+     *
+     * Slack rend le fil ENTIER — le message de tête en premier —, et il est
+     * déjà passé par l'import juste avant. Le laisser filer ici le republierait
+     * en commentaire sous lui-même : le registre ne l'arrêterait pas, puisque
+     * son `ts` est justement celui qu'on vient d'inscrire… ce qui le compterait
+     * « déjà là » et masquerait la faute au lieu de la montrer.
+     *
+     * @return Generator<int, array>
+     */
+    private function replies(string $channelId, string $threadTs): Generator
+    {
+        if ($threadTs === '') {
+            return;
+        }
+
+        $cursor = '';
+        $n = 0;
+
+        do {
+            $page = $this->api->replies($channelId, $threadTs, $cursor, self::PAGE_SIZE);
+
+            foreach ($page['messages'] as $message) {
+                if ((string) ($message['ts'] ?? '') === $threadTs) {
+                    continue;
+                }
+                yield $message;
+            }
+
+            $cursor = $page['cursor'];
+            $n++;
+        } while ($cursor !== '' && $n < self::MAX_PAGES);
     }
 
     /**

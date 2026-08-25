@@ -21,7 +21,8 @@ features:
 oauth_config:
   scopes:
     bot:
-      # Read messages — the substance of the bridge.
+      # Read messages — the substance of the bridge. Thread replies are read
+      # with the same scope: no extra permission is needed for them.
       - channels:history       # public channels
       - groups:history         # private channels
 

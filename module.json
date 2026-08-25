@@ -1,7 +1,7 @@
 {
     "id": "slack-bridge",
     "name": "Slack Bridge",
-    "description": "Mirrors chosen Slack channels into Space streams, posted under the matching member's own name. Edits and deletions in Slack follow through, and attachments come across.",
+    "description": "Mirrors chosen Slack channels into Space streams, posted under the matching member's own name and stamped with the time it was written. Thread replies come across as comments; edits, deletions and attachments follow through.",
     "keywords": [
         "slack",
         "integration",
@@ -10,7 +10,7 @@
         "stream",
         "webhook"
     ],
-    "version": "1.0.0",
+    "version": "1.1.0",
     "humhub": {
         "minVersion": "1.18"
     },

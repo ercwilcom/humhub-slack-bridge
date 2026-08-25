@@ -5,22 +5,26 @@ member's own name.
 
 Communities that ran on Slack before they ran on HumHub tend to keep running on
 Slack. This bridge lets the conversation carry over instead of asking people to
-move — a channel appears in a Space, signed by whoever wrote it, and stays in
-step as messages are edited and deleted.
+move — a channel appears in a Space, signed by whoever wrote it, dated when it
+was written, threads and all, and stays in step as messages are edited and
+deleted.
 
 | | |
 |---|---|
-| **Trigger** | any top-level message in a channel with an active rule |
+| **Trigger** | any message in a channel with an active rule |
+| **Top-level message** | becomes a post |
+| **Thread reply** | becomes a comment on that post |
 | **Author here** | the member whose HumHub email matches their Slack email |
 | **No match** | the message is skipped, silently to readers |
 | **Transport** | Slack Events API webhook — near real time |
-| **Attachments** | fetched and attached to the post |
+| **Attachments** | fetched and attached to the post or comment |
+| **Timestamps** | taken from Slack, never from the moment of import |
 | **Visibility** | public in the HumHub sense |
 
-Deliberately skipped: thread replies, bot and integration messages, service
-messages (joins, leaves, pins), and any channel without a rule.
+Deliberately skipped: bot and integration messages, service messages (joins,
+leaves, pins), and any channel without a rule.
 
-## Two things worth knowing before you install it
+## Four things worth knowing before you install it
 
 **The author must already exist here.** Matching is Slack email ↔ HumHub email.
 With no match the message is dropped. The consequence to accept: a channel
@@ -32,6 +36,24 @@ across whole.
 written in a conversational register. Slack edits and deletions are therefore
 propagated: deleting there deletes here. Without that, the only way to take back
 an unfortunate sentence would be to go through a HumHub administrator.
+
+**A thread becomes a comment thread.** A reply hangs off the post its opening
+message produced, which is the only shape that keeps a conversation readable —
+five independent posts in a stream are five strangers. Two consequences follow
+from it. A reply whose opening message was never mirrored (unmatched author, an
+"images only" rule, a channel wired up later) has nothing here to hang on, and
+is skipped under its own reason: mirroring it as a fresh post would publish, in
+somebody's name, a message the bridge had deliberately left out. And the rule's
+own conditions — "images only", the topic — apply to what *opens* a
+conversation, not to what is said in reply to it.
+
+**Timestamps come from Slack.** A post and a comment carry the time their
+message was written, not the time it was copied. In real time the difference is
+a few seconds, which is exactly what makes it easy to miss: the day the webhook
+is down for an hour, the day the hourly sweep catches up, the day a 30 MB
+attachment holds the import — that is when the only honest date is Slack's. It
+also keeps HumHub's "edited" pencil truthful: it appears when Slack says the
+message was edited, and not before.
 
 ## Setup
 
@@ -86,8 +108,21 @@ also apply a topic to every post, and can require that a message carry an image.
 php protected/yii slack-bridge/status     # what is configured, and what has come through
 php protected/yii slack-bridge/channels   # list channels the bot can see
 php protected/yii slack-bridge/retry      # re-run events left pending
-php protected/yii slack-bridge/backfill   # bring in a channel's history
+php protected/yii slack-bridge/backfill   # bring in a channel's history, threads included
+php protected/yii slack-bridge/redate     # re-stamp what was mirrored before dates came from Slack
 ```
+
+`backfill` walks each thread right after the message that opens it — replies
+need their post to exist before they have anywhere to go. It is re-runnable: a
+message already mirrored is recognised and skipped, so running it after an
+upgrade brings across the replies of the threads it had already mirrored.
+History imports are silent and back-dated; nobody is notified about a
+conversation that ended two months ago.
+
+`redate` is the one-off catch-up for an installation that mirrored anything
+before timestamps came from Slack: it re-stamps every mirrored post and comment
+from the message that produced it. A message Slack recorded as edited keeps its
+edit time, so the pencil that is *true* survives. Run it once after upgrading.
 
 An hourly cron sweep retries anything that failed in flight. The normal path is
 inline, right after answering Slack's 200.
