@@ -111,6 +111,12 @@ A message can go to **a Space's stream** or to **the author's own profile**
 (useful for a general noticeboard channel with no Space behind it). A rule can
 also apply a topic to every post, and can require that a message carry an image.
 
+Changing a rule's Space only changes where *new* messages go. To bring what was
+already mirrored along, run `php protected/yii slack-bridge/move`: every post
+whose rule now points elsewhere is moved there with its comments and activity
+entries, its topics re-applied in the new Space, nobody notified, no "edited"
+mark. It is re-runnable and does nothing to posts already in place.
+
 ## Console
 
 ```
@@ -122,6 +128,7 @@ php protected/yii slack-bridge/redate     # re-stamp what was mirrored before da
 php protected/yii slack-bridge/unpaired  # who writes here without a matching account
 php protected/yii slack-bridge/pair      # pair a Slack author to an account (or never pair it)
 php protected/yii slack-bridge/replay    # re-examine skips whose reason has been lifted
+php protected/yii slack-bridge/move      # bring mirrored history to where its rule points today
 ```
 
 `backfill` walks each thread right after the message that opens it — replies

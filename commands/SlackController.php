@@ -13,6 +13,7 @@ use humhub\modules\slackBridge\services\MessageImporter;
 use humhub\modules\slackBridge\services\Replayer;
 use humhub\modules\slackBridge\services\SlackApi;
 use humhub\modules\slackBridge\services\Sweeper;
+use humhub\modules\activity\models\Activity;
 use humhub\modules\post\models\Post;
 use humhub\modules\space\models\Space;
 use humhub\modules\user\models\User;
@@ -30,6 +31,7 @@ use yii\helpers\Console;
  *   php protected/yii slack-bridge/retry     reprise des événements en attente
  *   php protected/yii slack-bridge/backfill  reprise de l'historique (90 jours max)
  *   php protected/yii slack-bridge/retag     appose « Via Slack » au déjà republié
+ *   php protected/yii slack-bridge/move      ramène l'historique là où sa règle vise aujourd'hui
  */
 class SlackController extends Controller
 {
@@ -60,6 +62,7 @@ class SlackController extends Controller
             parent::options($actionID),
             match ($actionID) {
                 'backfill' => ['dryRun', 'limit', 'since'],
+                'move' => ['dryRun'],
                 'pair' => ['never', 'forget'],
                 'replay' => ['reason'],
                 default => [],
@@ -502,6 +505,129 @@ class SlackController extends Controller
         }
 
         return ExitCode::OK;
+    }
+
+    /**
+     * Ramène ce qui est déjà republié dans l'espace que sa règle vise AUJOURD'HUI.
+     *
+     *   php protected/yii slack-bridge/move [--dryRun]
+     *
+     * Changer l'espace d'une règle ne déplace que l'avenir : les nouveaux
+     * messages suivent, l'historique reste où il a été publié. Cette commande
+     * fait suivre l'historique — chaque post dont le lien nomme un autre espace
+     * que celui de sa règle est déplacé, avec ses commentaires (ils pendent au
+     * post, pas à l'espace) et ses traces d'activité (elles, pendent à
+     * l'espace, et resteraient sinon dans l'ancien fil à désigner un post
+     * parti).
+     *
+     * Rien n'est notifié : le cœur ne prévient personne d'un déplacement, et
+     * la date de modification n'est pas touchée — pas de faux crayon.
+     * Rejouable : un post déjà à sa place est compté « déjà là ».
+     *
+     * Ce que le cœur défait en déplaçant, et qu'on repose : les étiquettes.
+     * Un topic appartient à l'espace, donc `Content::move()` retire tout
+     * lien d'étiquette ; on remet celui de la règle et « Via Slack », créés
+     * dans l'espace d'arrivée s'ils n'y sont pas.
+     *
+     * Une règle qui vise le profil de l'auteur n'a pas d'espace : ses posts
+     * ne sont pas concernés et ne bougent pas.
+     */
+    public function actionMove(): int
+    {
+        $importer = new MessageImporter();
+        $rules = [];
+        foreach (SlackChannel::find()->where(['target' => SlackChannel::TARGET_SPACE])->all() as $rule) {
+            $rules[$rule->channel_id] = $rule;
+        }
+
+        $spaces = [];
+        $moved = $already = $missing = $failed = $noRule = 0;
+
+        foreach (SlackMessage::find()->where(['comment_id' => null])->all() as $mirror) {
+            $rule = $rules[$mirror->channel_id] ?? null;
+            if ($rule === null) {
+                // Règle supprimée, ou règle « profil » : aucun espace à viser.
+                $noRule++;
+                continue;
+            }
+
+            $target = (int) $rule->space_id;
+            if ((int) $mirror->space_id === $target) {
+                $already++;
+                continue;
+            }
+
+            $post = Post::findOne(['id' => $mirror->post_id]);
+            if ($post === null) {
+                // Retiré du Hub depuis — le lien survit à son post, ce n'est
+                // pas une anomalie à corriger ici.
+                $missing++;
+                continue;
+            }
+
+            $space = $spaces[$target] ??= Space::findOne(['id' => $target]);
+            if ($space === null) {
+                $this->stderr('  règle ' . $rule->channel_id . ' : espace #' . $target . " introuvable\n", Console::FG_RED);
+                $failed++;
+                continue;
+            }
+
+            if ($this->dryRun) {
+                $moved++;
+                continue;
+            }
+
+            // Sous l'identité de l'auteur, comme à la republication : reposer
+            // une étiquette touche au contenu de quelqu'un, et le cœur regarde
+            // qui le fait. Le déplacement lui-même est forcé : c'est un geste
+            // d'administration, pas un droit de l'auteur.
+            $author = User::findOne(['id' => $post->content->created_by]);
+            $previous = Yii::$app->user->identity;
+
+            try {
+                if ($author !== null) {
+                    Yii::$app->user->setIdentity($author);
+                }
+
+                $post->move($space, true);
+                $importer->applyTopics($post, array_filter([$rule->topic_name, MessageImporter::ORIGIN_TOPIC]));
+
+                foreach (Activity::find()->where(['object_model' => Post::class, 'object_id' => $post->id])->all() as $activity) {
+                    if ((int) $activity->content->contentcontainer_id !== (int) $space->contentcontainer_id) {
+                        $activity->move($space, true);
+                    }
+                }
+
+                // Le post ET les commentaires de son fil désignent le nouvel
+                // espace : c'est par ce lien qu'une reprise sait où elle en est.
+                Yii::$app->db->createCommand()
+                    ->update(SlackMessage::tableName(), ['space_id' => $target], ['post_id' => $post->id])
+                    ->execute();
+
+                $moved++;
+            } catch (Throwable $e) {
+                $this->stderr('  post ' . $post->id . ' : ' . $e->getMessage() . "\n", Console::FG_RED);
+                $failed++;
+            } finally {
+                Yii::$app->user->setIdentity($previous);
+            }
+
+            if ($moved % 25 === 0) {
+                $this->stdout('.');
+            }
+        }
+
+        $this->stdout(sprintf(
+            "\n%d posts %s, %d déjà à leur place, %d sans espace de règle, %d disparus, %d échecs\n",
+            $moved,
+            $this->dryRun ? 'à déplacer' : 'déplacés',
+            $already,
+            $noRule,
+            $missing,
+            $failed,
+        ));
+
+        return $failed === 0 ? ExitCode::OK : ExitCode::UNSPECIFIED_ERROR;
     }
 
     /** Reprend les événements en attente ou en échec. */
